@@ -25,6 +25,11 @@ func New(base string) *Client {
 }
 
 func (c *Client) SchedulePurchase(ctx context.Context, orderID, supplierID, methodID, termID string, amount float64, at time.Time) error {
+	// A zero-value order has no cash to schedule, and cashflow rejects amount <= 0.
+	// Orders are only scheduled once, on creation, so there is nothing to clear.
+	if amount <= 0 {
+		return nil
+	}
 	raw, err := json.Marshal(map[string]any{
 		"direction":         "OUT",
 		"amount":            amount,
