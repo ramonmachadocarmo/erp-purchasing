@@ -38,6 +38,8 @@ func (h *Handler) Register(r *gin.Engine, jwt gin.HandlerFunc) {
 	api.GET("/purchase-orders/:id", h.getOrder)
 	api.PUT("/purchase-orders/:id", h.updateOrder)
 	api.DELETE("/purchase-orders/:id", h.deleteOrder)
+	api.PUT("/purchase-orders/:id/payment-status", h.setPaymentStatus)
+	api.PUT("/purchase-orders/:id/delivery-status", h.setDeliveryStatus)
 	api.POST("/purchase-orders/:id/receive", h.receive)
 	api.POST("/purchase-orders/:id/confer", h.confer)
 	api.POST("/purchase-orders/:id/cancel", h.cancel)
@@ -219,6 +221,33 @@ func (h *Handler) deleteOrder(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+func (h *Handler) setPaymentStatus(c *gin.Context) {
+	h.setStatus(c, h.svc.SetPaymentStatus)
+}
+
+func (h *Handler) setDeliveryStatus(c *gin.Context) {
+	h.setStatus(c, h.svc.SetDeliveryStatus)
+}
+
+func (h *Handler) setStatus(c *gin.Context, apply func(ctx context.Context, id, status string) error) {
+	var in struct {
+		Status string `json:"status"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		httpserver.Error(c, http.StatusBadRequest, err)
+		return
+	}
+	if err := apply(c.Request.Context(), c.Param("id"), in.Status); err != nil {
+		status := http.StatusNotFound
+		if errors.Is(err, domain.ErrInvalid) {
+			status = http.StatusConflict
+		}
+		httpserver.Error(c, status, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
 func (h *Handler) receive(c *gin.Context) {
 	var in struct {
 		WarehouseID string `json:"warehouse_id"`
@@ -248,7 +277,7 @@ func (h *Handler) confer(c *gin.Context) {
 }
 
 func (h *Handler) cancel(c *gin.Context) {
-	if err := h.svc.Cancel(c.Request.Context(), c.Param("id")); err != nil {
+	if err := h.svc.Cancel(h.withAuth(c), c.Param("id")); err != nil {
 		status := http.StatusNotFound
 		if errors.Is(err, domain.ErrInvalid) {
 			status = http.StatusConflict

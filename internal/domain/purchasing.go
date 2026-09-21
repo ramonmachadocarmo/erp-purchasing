@@ -21,7 +21,15 @@ const (
 	OrderReceived  = "RECEIVED"
 	OrderConferred = "CONFERRED"
 	OrderCancelled = "CANCELLED"
+
+	// Eixo financeiro do pedido (independente do status de entrega acima).
+	PaymentPending = "PENDING"
+	PaymentPaid    = "PAID"
 )
+
+// Status de entrega, como aparecem na tela: APPROVED = "pendente entrega", RECEIVED = recebido
+// (entrada em estoque feita, falta conferir), CONFERRED = "finalizado", CANCELLED = "cancelado".
+// Os valores técnicos são mantidos porque outros serviços (bi) já filtram por APPROVED.
 
 type OrderItem struct {
 	ID         string  `json:"id,omitempty"`
@@ -51,6 +59,8 @@ type PurchaseOrder struct {
 	PaymentMethodID      string      `json:"payment_method_id"`
 	PaymentTermID        string      `json:"payment_term_id"`
 	Status               string      `json:"status"`
+	PaymentStatus        string      `json:"payment_status"`
+	StockReceived        bool        `json:"stock_received"`
 	TotalAmount          float64     `json:"total_amount"`
 	ExpectedDeliveryDate *time.Time  `json:"expected_delivery_date"`
 	Items                []OrderItem `json:"items"`
@@ -101,11 +111,13 @@ type OrderRepository interface {
 	Create(ctx context.Context, o PurchaseOrder) (PurchaseOrder, error)
 	Get(ctx context.Context, id string) (PurchaseOrder, error)
 	List(ctx context.Context) ([]PurchaseOrder, error)
+	// UpdateStatus sets the delivery status; moving to RECEIVED also flags stock_received.
 	UpdateStatus(ctx context.Context, id, status string) error
-	// Update replaces supplier, payment, expected date, total and items of an APPROVED order;
-	// ErrInvalid if the order is no longer APPROVED.
+	SetPaymentStatus(ctx context.Context, id, status string) error
+	// Update replaces supplier, payment, expected date, total and items of an order that is
+	// APPROVED (pending delivery) and PENDING payment; ErrInvalid otherwise.
 	Update(ctx context.Context, o PurchaseOrder) (PurchaseOrder, error)
-	// Delete removes an APPROVED order (items cascade); ErrInvalid if it is no longer APPROVED.
+	// Delete removes an order under the same conditions as Update (items cascade).
 	Delete(ctx context.Context, id string) error
 }
 

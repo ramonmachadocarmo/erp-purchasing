@@ -36,6 +36,19 @@ func (m *memOrders) UpdateStatus(_ context.Context, id, status string) error {
 		return domain.ErrNotFound
 	}
 	o.Status = status
+	if status == domain.OrderReceived {
+		o.StockReceived = true
+	}
+	m.byID[id] = o
+	return nil
+}
+
+func (m *memOrders) SetPaymentStatus(_ context.Context, id, status string) error {
+	o, ok := m.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	o.PaymentStatus = status
 	m.byID[id] = o
 	return nil
 }
@@ -45,7 +58,7 @@ func (m *memOrders) Update(_ context.Context, o domain.PurchaseOrder) (domain.Pu
 	if !ok {
 		return domain.PurchaseOrder{}, domain.ErrNotFound
 	}
-	if cur.Status != domain.OrderApproved {
+	if cur.Status != domain.OrderApproved || cur.PaymentStatus == domain.PaymentPaid {
 		return domain.PurchaseOrder{}, domain.ErrInvalid
 	}
 	m.byID[o.ID] = o
@@ -57,7 +70,7 @@ func (m *memOrders) Delete(_ context.Context, id string) error {
 	if !ok {
 		return domain.ErrNotFound
 	}
-	if cur.Status != domain.OrderApproved {
+	if cur.Status != domain.OrderApproved || cur.PaymentStatus == domain.PaymentPaid {
 		return domain.ErrInvalid
 	}
 	delete(m.byID, id)
@@ -328,6 +341,104 @@ func TestDeleteOrderReceivedRejected(t *testing.T) {
 	svc := New(orders, &memQuotes{}, okDir{}, &nopCatalog{}, policy{}, &cashSpy{})
 	if err := svc.DeleteOrder(context.Background(), "po1"); err != domain.ErrInvalid {
 		t.Fatalf("%v", err)
+	}
+}
+
+func TestCreateOrderStartsPaymentPending(t *testing.T) {
+	svc := New(&memOrders{}, &memQuotes{}, okDir{}, &nopCatalog{}, policy{}, &cashSpy{})
+	got, err := svc.CreateOrder(context.Background(), domain.PurchaseOrder{
+		SupplierID: "s1", PaymentMethodID: "m", PaymentTermID: "t",
+		Items: []domain.OrderItem{{ProductID: "p", Quantity: 1, UnitPrice: 10}},
+	})
+	if err != nil || got.PaymentStatus != domain.PaymentPending || got.Status != domain.OrderApproved {
+		t.Fatalf("%v %+v", err, got)
+	}
+}
+
+func TestPaidOrderCannotBeEditedOrDeleted(t *testing.T) {
+	orders := &memOrders{byID: map[string]domain.PurchaseOrder{
+		"po1": {ID: "po1", Status: domain.OrderApproved, PaymentStatus: domain.PaymentPaid, SupplierID: "s1"},
+	}}
+	svc := New(orders, &memQuotes{}, okDir{}, &nopCatalog{}, policy{}, &cashSpy{})
+	_, err := svc.UpdateOrder(context.Background(), "po1", domain.PurchaseOrder{
+		SupplierID: "s1", PaymentMethodID: "m", PaymentTermID: "t",
+		Items: []domain.OrderItem{{ProductID: "p", Quantity: 1, UnitPrice: 10}},
+	})
+	if err != domain.ErrInvalid {
+		t.Fatalf("update: %v", err)
+	}
+	if err := svc.DeleteOrder(context.Background(), "po1"); err != domain.ErrInvalid {
+		t.Fatalf("delete: %v", err)
+	}
+	// reopening the payment makes it editable again
+	if err := svc.SetPaymentStatus(context.Background(), "po1", domain.PaymentPending); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DeleteOrder(context.Background(), "po1"); err != nil {
+		t.Fatalf("delete after reopen: %v", err)
+	}
+}
+
+func TestSetPaymentStatus(t *testing.T) {
+	orders := &memOrders{byID: map[string]domain.PurchaseOrder{
+		"po1": {ID: "po1", Status: domain.OrderApproved, PaymentStatus: domain.PaymentPending},
+		"po2": {ID: "po2", Status: domain.OrderCancelled, PaymentStatus: domain.PaymentPending},
+	}}
+	svc := New(orders, &memQuotes{}, okDir{}, &nopCatalog{}, policy{}, &cashSpy{})
+	if err := svc.SetPaymentStatus(context.Background(), "po1", domain.PaymentPaid); err != nil || orders.byID["po1"].PaymentStatus != domain.PaymentPaid {
+		t.Fatalf("%v %+v", err, orders.byID["po1"])
+	}
+	if err := svc.SetPaymentStatus(context.Background(), "po1", "BOGUS"); err != domain.ErrInvalid {
+		t.Fatalf("bogus: %v", err)
+	}
+	if err := svc.SetPaymentStatus(context.Background(), "po2", domain.PaymentPaid); err != domain.ErrInvalid {
+		t.Fatalf("cancelled: %v", err)
+	}
+}
+
+func TestSetDeliveryStatusManual(t *testing.T) {
+	orders := &memOrders{byID: map[string]domain.PurchaseOrder{
+		"open":     {ID: "open", Status: domain.OrderApproved},
+		"received": {ID: "received", Status: domain.OrderReceived, StockReceived: true},
+		"done":     {ID: "done", Status: domain.OrderConferred, StockReceived: true},
+		"manual":   {ID: "manual", Status: domain.OrderConferred, StockReceived: false},
+		"cancel":   {ID: "cancel", Status: domain.OrderCancelled},
+	}}
+	svc := New(orders, &memQuotes{}, okDir{}, &nopCatalog{}, policy{}, &cashSpy{})
+	ctx := context.Background()
+	if err := svc.SetDeliveryStatus(ctx, "open", domain.OrderConferred); err != nil || orders.byID["open"].Status != domain.OrderConferred {
+		t.Fatalf("finalize by hand: %v", err)
+	}
+	if err := svc.SetDeliveryStatus(ctx, "received", domain.OrderConferred); err != nil || orders.byID["received"].Status != domain.OrderConferred {
+		t.Fatalf("finalize received: %v", err)
+	}
+	if err := svc.SetDeliveryStatus(ctx, "done", domain.OrderApproved); err != domain.ErrInvalid {
+		t.Fatalf("reopen after stock entry must be refused: %v", err)
+	}
+	if err := svc.SetDeliveryStatus(ctx, "manual", domain.OrderApproved); err != nil || orders.byID["manual"].Status != domain.OrderApproved {
+		t.Fatalf("reopen manual finalize: %v", err)
+	}
+	if err := svc.SetDeliveryStatus(ctx, "cancel", domain.OrderConferred); err != domain.ErrInvalid {
+		t.Fatalf("cancelled: %v", err)
+	}
+	if err := svc.SetDeliveryStatus(ctx, "open", domain.OrderReceived); err != domain.ErrInvalid {
+		t.Fatalf("RECEIVED only via Receber: %v", err)
+	}
+}
+
+func TestCancelClearsCashflow(t *testing.T) {
+	cash := &cashSpy{}
+	orders := &memOrders{byID: map[string]domain.PurchaseOrder{"po1": {ID: "po1", Status: domain.OrderApproved}}}
+	svc := New(orders, &memQuotes{}, okDir{}, &nopCatalog{}, policy{}, cash)
+	if err := svc.Cancel(context.Background(), "po1"); err != nil {
+		t.Fatal(err)
+	}
+	if orders.byID["po1"].Status != domain.OrderCancelled || cash.cancelled != 1 {
+		t.Fatalf("%+v %+v", orders.byID["po1"], cash)
+	}
+	// retry after a cashflow failure: already cancelled, still cleans up
+	if err := svc.Cancel(context.Background(), "po1"); err != nil || cash.cancelled != 2 {
+		t.Fatalf("%v %+v", err, cash)
 	}
 }
 

@@ -27,9 +27,9 @@ func (o Orders) Create(ctx context.Context, po domain.PurchaseOrder) (domain.Pur
 	}
 	defer tx.Rollback(ctx)
 	err = tx.QueryRow(ctx, `
-		INSERT INTO purchase_orders (supplier_id, status, total_amount, expected_delivery_date, quote_id, payment_method_id, payment_term_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, created_at
-	`, po.SupplierID, po.Status, po.TotalAmount, po.ExpectedDeliveryDate, po.QuoteID, po.PaymentMethodID, po.PaymentTermID).Scan(&po.ID, &po.CreatedAt)
+		INSERT INTO purchase_orders (supplier_id, status, payment_status, total_amount, expected_delivery_date, quote_id, payment_method_id, payment_term_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, created_at
+	`, po.SupplierID, po.Status, po.PaymentStatus, po.TotalAmount, po.ExpectedDeliveryDate, po.QuoteID, po.PaymentMethodID, po.PaymentTermID).Scan(&po.ID, &po.CreatedAt)
 	if err != nil {
 		return domain.PurchaseOrder{}, err
 	}
@@ -50,9 +50,9 @@ func (o Orders) Create(ctx context.Context, po domain.PurchaseOrder) (domain.Pur
 func (o Orders) Get(ctx context.Context, id string) (domain.PurchaseOrder, error) {
 	var po domain.PurchaseOrder
 	err := o.pool.QueryRow(ctx, `
-		SELECT id, supplier_id, status, total_amount, expected_delivery_date, created_at, quote_id, payment_method_id, payment_term_id
+		SELECT id, supplier_id, status, payment_status, stock_received, total_amount, expected_delivery_date, created_at, quote_id, payment_method_id, payment_term_id
 		FROM purchase_orders WHERE id=$1
-	`, id).Scan(&po.ID, &po.SupplierID, &po.Status, &po.TotalAmount, &po.ExpectedDeliveryDate, &po.CreatedAt, &po.QuoteID, &po.PaymentMethodID, &po.PaymentTermID)
+	`, id).Scan(&po.ID, &po.SupplierID, &po.Status, &po.PaymentStatus, &po.StockReceived, &po.TotalAmount, &po.ExpectedDeliveryDate, &po.CreatedAt, &po.QuoteID, &po.PaymentMethodID, &po.PaymentTermID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.PurchaseOrder{}, domain.ErrNotFound
 	}
@@ -66,7 +66,7 @@ func (o Orders) Get(ctx context.Context, id string) (domain.PurchaseOrder, error
 
 func (o Orders) List(ctx context.Context) ([]domain.PurchaseOrder, error) {
 	rows, err := o.pool.Query(ctx, `
-		SELECT id, supplier_id, status, total_amount, expected_delivery_date, created_at, quote_id, payment_method_id, payment_term_id
+		SELECT id, supplier_id, status, payment_status, stock_received, total_amount, expected_delivery_date, created_at, quote_id, payment_method_id, payment_term_id
 		FROM purchase_orders ORDER BY created_at DESC
 	`)
 	if err != nil {
@@ -76,7 +76,7 @@ func (o Orders) List(ctx context.Context) ([]domain.PurchaseOrder, error) {
 	var out []domain.PurchaseOrder
 	for rows.Next() {
 		var po domain.PurchaseOrder
-		if err := rows.Scan(&po.ID, &po.SupplierID, &po.Status, &po.TotalAmount, &po.ExpectedDeliveryDate, &po.CreatedAt, &po.QuoteID, &po.PaymentMethodID, &po.PaymentTermID); err != nil {
+		if err := rows.Scan(&po.ID, &po.SupplierID, &po.Status, &po.PaymentStatus, &po.StockReceived, &po.TotalAmount, &po.ExpectedDeliveryDate, &po.CreatedAt, &po.QuoteID, &po.PaymentMethodID, &po.PaymentTermID); err != nil {
 			return nil, err
 		}
 		items, err := o.items(ctx, po.ID)
@@ -93,7 +93,18 @@ func (o Orders) List(ctx context.Context) ([]domain.PurchaseOrder, error) {
 }
 
 func (o Orders) UpdateStatus(ctx context.Context, id, status string) error {
-	tag, err := o.pool.Exec(ctx, `UPDATE purchase_orders SET status=$2 WHERE id=$1`, id, status)
+	tag, err := o.pool.Exec(ctx, `UPDATE purchase_orders SET status=$2, stock_received = stock_received OR $2::text = $3::text WHERE id=$1`, id, status, domain.OrderReceived)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (o Orders) SetPaymentStatus(ctx context.Context, id, status string) error {
+	tag, err := o.pool.Exec(ctx, `UPDATE purchase_orders SET payment_status=$2 WHERE id=$1`, id, status)
 	if err != nil {
 		return err
 	}
@@ -111,8 +122,8 @@ func (o Orders) Update(ctx context.Context, po domain.PurchaseOrder) (domain.Pur
 	defer tx.Rollback(ctx)
 	tag, err := tx.Exec(ctx, `
 		UPDATE purchase_orders SET supplier_id=$2, payment_method_id=$3, payment_term_id=$4, total_amount=$5, expected_delivery_date=$6
-		WHERE id=$1 AND status=$7
-	`, po.ID, po.SupplierID, po.PaymentMethodID, po.PaymentTermID, po.TotalAmount, po.ExpectedDeliveryDate, domain.OrderApproved)
+		WHERE id=$1 AND status=$7 AND payment_status=$8
+	`, po.ID, po.SupplierID, po.PaymentMethodID, po.PaymentTermID, po.TotalAmount, po.ExpectedDeliveryDate, domain.OrderApproved, domain.PaymentPending)
 	if err != nil {
 		return domain.PurchaseOrder{}, err
 	}
@@ -137,7 +148,7 @@ func (o Orders) Update(ctx context.Context, po domain.PurchaseOrder) (domain.Pur
 }
 
 func (o Orders) Delete(ctx context.Context, id string) error {
-	tag, err := o.pool.Exec(ctx, `DELETE FROM purchase_orders WHERE id=$1 AND status=$2`, id, domain.OrderApproved)
+	tag, err := o.pool.Exec(ctx, `DELETE FROM purchase_orders WHERE id=$1 AND status=$2 AND payment_status=$3`, id, domain.OrderApproved, domain.PaymentPending)
 	if err != nil {
 		return err
 	}
@@ -306,6 +317,7 @@ func (q Quotes) Convert(ctx context.Context, quote domain.Quote, methodID, termI
 		PaymentMethodID: methodID,
 		PaymentTermID:   termID,
 		Status:          domain.OrderApproved,
+		PaymentStatus:   domain.PaymentPending,
 		TotalAmount:     quote.TotalAmount,
 		Items:           quote.Items,
 	}

@@ -137,6 +137,7 @@ func (s *Service) CreateOrder(ctx context.Context, o domain.PurchaseOrder) (doma
 	o.Items = items
 	o.TotalAmount = total
 	o.Status = domain.OrderApproved
+	o.PaymentStatus = domain.PaymentPending
 	created, err := s.orders.Create(ctx, o)
 	if err != nil {
 		return domain.PurchaseOrder{}, err
@@ -155,14 +156,20 @@ func (s *Service) ListOrders(ctx context.Context) ([]domain.PurchaseOrder, error
 	return s.orders.List(ctx)
 }
 
-// UpdateOrder edits an APPROVED order and re-plans its cash schedule (cashflow replaces the
+// editable: an order can only be edited/deleted while it is pending delivery and unpaid —
+// a paid order already moved money, so it has to be reopened (payment back to PENDING) first.
+func editable(o domain.PurchaseOrder) bool {
+	return o.Status == domain.OrderApproved && o.PaymentStatus != domain.PaymentPaid
+}
+
+// UpdateOrder edits a pending-delivery, unpaid order and re-plans its cash schedule (cashflow replaces the
 // whole schedule of the reference, so it stays derived from the order's current state).
 func (s *Service) UpdateOrder(ctx context.Context, id string, o domain.PurchaseOrder) (domain.PurchaseOrder, error) {
 	cur, err := s.orders.Get(ctx, id)
 	if err != nil {
 		return domain.PurchaseOrder{}, err
 	}
-	if cur.Status != domain.OrderApproved {
+	if !editable(cur) {
 		return domain.PurchaseOrder{}, domain.ErrInvalid
 	}
 	if o.PaymentMethodID == "" || o.PaymentTermID == "" {
@@ -179,6 +186,7 @@ func (s *Service) UpdateOrder(ctx context.Context, id string, o domain.PurchaseO
 	o.Items = items
 	o.TotalAmount = total
 	o.Status = domain.OrderApproved
+	o.PaymentStatus = domain.PaymentPending
 	o.QuoteID = cur.QuoteID
 	o.CreatedAt = cur.CreatedAt
 	updated, err := s.orders.Update(ctx, o)
@@ -196,13 +204,13 @@ func (s *Service) UpdateOrder(ctx context.Context, id string, o domain.PurchaseO
 	return updated, nil
 }
 
-// DeleteOrder removes an APPROVED order and clears its cash schedule.
+// DeleteOrder removes a pending-delivery, unpaid order and clears its cash schedule.
 func (s *Service) DeleteOrder(ctx context.Context, id string) error {
 	cur, err := s.orders.Get(ctx, id)
 	if err != nil {
 		return err
 	}
-	if cur.Status != domain.OrderApproved {
+	if !editable(cur) {
 		return domain.ErrInvalid
 	}
 	if err := s.orders.Delete(ctx, id); err != nil {
@@ -250,6 +258,8 @@ func (s *Service) Confer(ctx context.Context, id string) error {
 	return s.orders.UpdateStatus(ctx, id, domain.OrderConferred)
 }
 
+// Cancel cancels an order that has not been received yet and clears its cash schedule.
+// Idempotent: cancelling an already-cancelled order just retries the cashflow clean-up.
 func (s *Service) Cancel(ctx context.Context, id string) error {
 	o, err := s.orders.Get(ctx, id)
 	if err != nil {
@@ -258,5 +268,49 @@ func (s *Service) Cancel(ctx context.Context, id string) error {
 	if o.Status == domain.OrderReceived || o.Status == domain.OrderConferred {
 		return domain.ErrInvalid
 	}
-	return s.orders.UpdateStatus(ctx, id, domain.OrderCancelled)
+	if o.Status != domain.OrderCancelled {
+		if err := s.orders.UpdateStatus(ctx, id, domain.OrderCancelled); err != nil {
+			return err
+		}
+	}
+	return s.cashflow.CancelPurchase(ctx, id)
+}
+
+// SetPaymentStatus is the manual PENDING <-> PAID toggle of the financial axis.
+func (s *Service) SetPaymentStatus(ctx context.Context, id, status string) error {
+	if status != domain.PaymentPending && status != domain.PaymentPaid {
+		return domain.ErrInvalid
+	}
+	o, err := s.orders.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if o.Status == domain.OrderCancelled {
+		return domain.ErrInvalid
+	}
+	return s.orders.SetPaymentStatus(ctx, id, status)
+}
+
+// SetDeliveryStatus is the manual override of the delivery axis (the NF flow — Receber and
+// Conferir — moves it too): APPROVED (pending delivery) or CONFERRED (finalized). Finalizing
+// by hand does not touch stock. Reopening is refused once stock was received, otherwise a
+// later Receber would enter the goods twice.
+func (s *Service) SetDeliveryStatus(ctx context.Context, id, status string) error {
+	if status != domain.OrderApproved && status != domain.OrderConferred {
+		return domain.ErrInvalid
+	}
+	o, err := s.orders.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if o.Status == domain.OrderCancelled {
+		return domain.ErrInvalid
+	}
+	if o.Status == status {
+		return nil
+	}
+	if status == domain.OrderApproved && o.StockReceived {
+		return domain.ErrInvalid
+	}
+	return s.orders.UpdateStatus(ctx, id, status)
 }
