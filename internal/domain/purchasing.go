@@ -102,6 +102,11 @@ type OrderRepository interface {
 	Get(ctx context.Context, id string) (PurchaseOrder, error)
 	List(ctx context.Context) ([]PurchaseOrder, error)
 	UpdateStatus(ctx context.Context, id, status string) error
+	// Update replaces supplier, payment, expected date, total and items of an APPROVED order;
+	// ErrInvalid if the order is no longer APPROVED.
+	Update(ctx context.Context, o PurchaseOrder) (PurchaseOrder, error)
+	// Delete removes an APPROVED order (items cascade); ErrInvalid if it is no longer APPROVED.
+	Delete(ctx context.Context, id string) error
 }
 
 type Catalog interface {
@@ -111,6 +116,7 @@ type Catalog interface {
 
 type Cashflow interface {
 	SchedulePurchase(ctx context.Context, orderID, supplierID, methodID, termID string, amount float64, at time.Time) error
+	CancelPurchase(ctx context.Context, orderID string) error
 }
 
 func Totals(items []OrderItem) ([]OrderItem, float64) {

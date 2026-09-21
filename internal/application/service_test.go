@@ -40,6 +40,30 @@ func (m *memOrders) UpdateStatus(_ context.Context, id, status string) error {
 	return nil
 }
 
+func (m *memOrders) Update(_ context.Context, o domain.PurchaseOrder) (domain.PurchaseOrder, error) {
+	cur, ok := m.byID[o.ID]
+	if !ok {
+		return domain.PurchaseOrder{}, domain.ErrNotFound
+	}
+	if cur.Status != domain.OrderApproved {
+		return domain.PurchaseOrder{}, domain.ErrInvalid
+	}
+	m.byID[o.ID] = o
+	return o, nil
+}
+
+func (m *memOrders) Delete(_ context.Context, id string) error {
+	cur, ok := m.byID[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if cur.Status != domain.OrderApproved {
+		return domain.ErrInvalid
+	}
+	delete(m.byID, id)
+	return nil
+}
+
 type memQuotes struct{ byID map[string]domain.Quote }
 
 func (m *memQuotes) Create(_ context.Context, q domain.Quote) (domain.Quote, error) {
@@ -118,8 +142,14 @@ func (c *nopCatalog) Receive(_ context.Context, _, warehouseID string, _ []domai
 }
 
 type cashSpy struct {
-	n      int
-	amount float64
+	n         int
+	amount    float64
+	cancelled int
+}
+
+func (c *cashSpy) CancelPurchase(context.Context, string) error {
+	c.cancelled++
+	return nil
 }
 
 func (c *cashSpy) SchedulePurchase(_ context.Context, _, _, _, _ string, amount float64, _ time.Time) error {
@@ -251,6 +281,53 @@ func TestReceiveUsesDefaultWarehouse(t *testing.T) {
 	}
 	if cat.receivedWH != "w1" || orders.byID["po1"].Status != domain.OrderReceived {
 		t.Fatalf("%s %s", cat.receivedWH, orders.byID["po1"].Status)
+	}
+}
+
+func TestUpdateOrderReschedulesCashflow(t *testing.T) {
+	cash := &cashSpy{}
+	orders := &memOrders{byID: map[string]domain.PurchaseOrder{
+		"po1": {ID: "po1", Status: domain.OrderApproved, SupplierID: "s1"},
+	}}
+	svc := New(orders, &memQuotes{}, okDir{}, &nopCatalog{}, policy{}, cash)
+	got, err := svc.UpdateOrder(context.Background(), "po1", domain.PurchaseOrder{
+		SupplierID: "s1", PaymentMethodID: "m", PaymentTermID: "t",
+		Items: []domain.OrderItem{{ProductID: "p", Quantity: 3, UnitPrice: 10}},
+	})
+	if err != nil || got.TotalAmount != 30 || cash.n != 1 || cash.amount != 30 {
+		t.Fatalf("%v %+v %+v", err, got, cash)
+	}
+}
+
+func TestUpdateOrderReceivedRejected(t *testing.T) {
+	orders := &memOrders{byID: map[string]domain.PurchaseOrder{"po1": {ID: "po1", Status: domain.OrderReceived}}}
+	svc := New(orders, &memQuotes{}, okDir{}, &nopCatalog{}, policy{}, &cashSpy{})
+	_, err := svc.UpdateOrder(context.Background(), "po1", domain.PurchaseOrder{
+		SupplierID: "s1", PaymentMethodID: "m", PaymentTermID: "t",
+		Items: []domain.OrderItem{{ProductID: "p", Quantity: 1, UnitPrice: 10}},
+	})
+	if err != domain.ErrInvalid {
+		t.Fatalf("%v", err)
+	}
+}
+
+func TestDeleteOrderApprovedCancelsCashflow(t *testing.T) {
+	cash := &cashSpy{}
+	orders := &memOrders{byID: map[string]domain.PurchaseOrder{"po1": {ID: "po1", Status: domain.OrderApproved}}}
+	svc := New(orders, &memQuotes{}, okDir{}, &nopCatalog{}, policy{}, cash)
+	if err := svc.DeleteOrder(context.Background(), "po1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := orders.byID["po1"]; ok || cash.cancelled != 1 {
+		t.Fatalf("%+v %+v", orders.byID, cash)
+	}
+}
+
+func TestDeleteOrderReceivedRejected(t *testing.T) {
+	orders := &memOrders{byID: map[string]domain.PurchaseOrder{"po1": {ID: "po1", Status: domain.OrderReceived}}}
+	svc := New(orders, &memQuotes{}, okDir{}, &nopCatalog{}, policy{}, &cashSpy{})
+	if err := svc.DeleteOrder(context.Background(), "po1"); err != domain.ErrInvalid {
+		t.Fatalf("%v", err)
 	}
 }
 

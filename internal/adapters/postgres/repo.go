@@ -103,6 +103,50 @@ func (o Orders) UpdateStatus(ctx context.Context, id, status string) error {
 	return nil
 }
 
+func (o Orders) Update(ctx context.Context, po domain.PurchaseOrder) (domain.PurchaseOrder, error) {
+	tx, err := o.pool.Begin(ctx)
+	if err != nil {
+		return domain.PurchaseOrder{}, err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `
+		UPDATE purchase_orders SET supplier_id=$2, payment_method_id=$3, payment_term_id=$4, total_amount=$5, expected_delivery_date=$6
+		WHERE id=$1 AND status=$7
+	`, po.ID, po.SupplierID, po.PaymentMethodID, po.PaymentTermID, po.TotalAmount, po.ExpectedDeliveryDate, domain.OrderApproved)
+	if err != nil {
+		return domain.PurchaseOrder{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.PurchaseOrder{}, domain.ErrInvalid
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM purchase_order_items WHERE purchase_order_id=$1`, po.ID); err != nil {
+		return domain.PurchaseOrder{}, err
+	}
+	for i, item := range po.Items {
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO purchase_order_items (purchase_order_id, product_id, quantity, unit_price, total_price)
+			VALUES ($1,$2,$3,$4,$5) RETURNING id
+		`, po.ID, item.ProductID, item.Quantity, item.UnitPrice, item.TotalPrice).Scan(&po.Items[i].ID); err != nil {
+			return domain.PurchaseOrder{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.PurchaseOrder{}, err
+	}
+	return po, nil
+}
+
+func (o Orders) Delete(ctx context.Context, id string) error {
+	tag, err := o.pool.Exec(ctx, `DELETE FROM purchase_orders WHERE id=$1 AND status=$2`, id, domain.OrderApproved)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrInvalid
+	}
+	return nil
+}
+
 func (o Orders) items(ctx context.Context, id string) ([]domain.OrderItem, error) {
 	rows, err := o.pool.Query(ctx, `
 		SELECT id, product_id, quantity, unit_price, total_price FROM purchase_order_items WHERE purchase_order_id=$1

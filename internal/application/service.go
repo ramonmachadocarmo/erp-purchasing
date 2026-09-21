@@ -155,6 +155,62 @@ func (s *Service) ListOrders(ctx context.Context) ([]domain.PurchaseOrder, error
 	return s.orders.List(ctx)
 }
 
+// UpdateOrder edits an APPROVED order and re-plans its cash schedule (cashflow replaces the
+// whole schedule of the reference, so it stays derived from the order's current state).
+func (s *Service) UpdateOrder(ctx context.Context, id string, o domain.PurchaseOrder) (domain.PurchaseOrder, error) {
+	cur, err := s.orders.Get(ctx, id)
+	if err != nil {
+		return domain.PurchaseOrder{}, err
+	}
+	if cur.Status != domain.OrderApproved {
+		return domain.PurchaseOrder{}, domain.ErrInvalid
+	}
+	if o.PaymentMethodID == "" || o.PaymentTermID == "" {
+		return domain.PurchaseOrder{}, domain.ErrInvalid
+	}
+	if err := s.dir.EnsureSupplier(ctx, o.SupplierID); err != nil {
+		return domain.PurchaseOrder{}, err
+	}
+	items, total := domain.Totals(o.Items)
+	if len(items) == 0 {
+		return domain.PurchaseOrder{}, domain.ErrInvalid
+	}
+	o.ID = id
+	o.Items = items
+	o.TotalAmount = total
+	o.Status = domain.OrderApproved
+	o.QuoteID = cur.QuoteID
+	o.CreatedAt = cur.CreatedAt
+	updated, err := s.orders.Update(ctx, o)
+	if err != nil {
+		return domain.PurchaseOrder{}, err
+	}
+	if updated.TotalAmount <= 0 {
+		err = s.cashflow.CancelPurchase(ctx, updated.ID)
+	} else {
+		err = s.cashflow.SchedulePurchase(ctx, updated.ID, updated.SupplierID, updated.PaymentMethodID, updated.PaymentTermID, updated.TotalAmount, updated.CreatedAt)
+	}
+	if err != nil {
+		return domain.PurchaseOrder{}, err
+	}
+	return updated, nil
+}
+
+// DeleteOrder removes an APPROVED order and clears its cash schedule.
+func (s *Service) DeleteOrder(ctx context.Context, id string) error {
+	cur, err := s.orders.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if cur.Status != domain.OrderApproved {
+		return domain.ErrInvalid
+	}
+	if err := s.orders.Delete(ctx, id); err != nil {
+		return err
+	}
+	return s.cashflow.CancelPurchase(ctx, id)
+}
+
 func (s *Service) Receive(ctx context.Context, id, warehouseID string) error {
 	o, err := s.orders.Get(ctx, id)
 	if err != nil {

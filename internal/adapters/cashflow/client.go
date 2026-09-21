@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -26,7 +27,7 @@ func New(base string) *Client {
 
 func (c *Client) SchedulePurchase(ctx context.Context, orderID, supplierID, methodID, termID string, amount float64, at time.Time) error {
 	// A zero-value order has no cash to schedule, and cashflow rejects amount <= 0.
-	// Orders are only scheduled once, on creation, so there is nothing to clear.
+	// (On edit, the service calls CancelPurchase instead so a stale schedule doesn't linger.)
 	if amount <= 0 {
 		return nil
 	}
@@ -48,6 +49,19 @@ func (c *Client) SchedulePurchase(ctx context.Context, orderID, supplierID, meth
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	return c.do(ctx, req)
+}
+
+// CancelPurchase clears the order's whole cash schedule (order edited to zero, or deleted).
+func (c *Client) CancelPurchase(ctx context.Context, orderID string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.base+"/schedule/PURCHASE/"+url.PathEscape(orderID), nil)
+	if err != nil {
+		return err
+	}
+	return c.do(ctx, req)
+}
+
+func (c *Client) do(ctx context.Context, req *http.Request) error {
 	if tok, ok := ctx.Value(AuthHeaderKey).(string); ok && tok != "" {
 		req.Header.Set("Authorization", tok)
 	}

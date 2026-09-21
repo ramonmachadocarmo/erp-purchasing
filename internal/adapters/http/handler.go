@@ -36,6 +36,8 @@ func (h *Handler) Register(r *gin.Engine, jwt gin.HandlerFunc) {
 	api.GET("/purchase-orders", h.listOrders)
 	api.POST("/purchase-orders", h.createOrder)
 	api.GET("/purchase-orders/:id", h.getOrder)
+	api.PUT("/purchase-orders/:id", h.updateOrder)
+	api.DELETE("/purchase-orders/:id", h.deleteOrder)
 	api.POST("/purchase-orders/:id/receive", h.receive)
 	api.POST("/purchase-orders/:id/confer", h.confer)
 	api.POST("/purchase-orders/:id/cancel", h.cancel)
@@ -183,6 +185,38 @@ func (h *Handler) getOrder(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+func (h *Handler) updateOrder(c *gin.Context) {
+	var in domain.PurchaseOrder
+	if err := c.ShouldBindJSON(&in); err != nil {
+		httpserver.Error(c, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.svc.UpdateOrder(h.withAuth(c), c.Param("id"), in)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, domain.ErrNotFound) {
+			status = http.StatusNotFound
+		} else if errors.Is(err, domain.ErrInvalid) {
+			status = http.StatusConflict
+		}
+		httpserver.Error(c, status, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+func (h *Handler) deleteOrder(c *gin.Context) {
+	if err := h.svc.DeleteOrder(h.withAuth(c), c.Param("id")); err != nil {
+		status := http.StatusNotFound
+		if errors.Is(err, domain.ErrInvalid) {
+			status = http.StatusConflict
+		}
+		httpserver.Error(c, status, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 
 func (h *Handler) receive(c *gin.Context) {
