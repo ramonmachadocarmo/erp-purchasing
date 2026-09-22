@@ -93,7 +93,12 @@ func (o Orders) List(ctx context.Context) ([]domain.PurchaseOrder, error) {
 }
 
 func (o Orders) UpdateStatus(ctx context.Context, id, status string) error {
-	tag, err := o.pool.Exec(ctx, `UPDATE purchase_orders SET status=$2, stock_received = stock_received OR $2::text = $3::text WHERE id=$1`, id, status, domain.OrderReceived)
+	// $2 is passed once per usage (status and the received flag) instead of reused across a
+	// plain assignment and a ::text-cast comparison: Postgres requires every occurrence of the
+	// same numbered parameter to resolve to one exact type, and varchar vs. an explicit ::text
+	// cast don't count as the same type even though they're implicitly compatible — that
+	// mismatch raised SQLSTATE 42P08 ("inconsistent types deduced for parameter $2") in production.
+	tag, err := o.pool.Exec(ctx, `UPDATE purchase_orders SET status=$2, stock_received = stock_received OR $3 WHERE id=$1`, id, status, status == domain.OrderReceived)
 	if err != nil {
 		return err
 	}
